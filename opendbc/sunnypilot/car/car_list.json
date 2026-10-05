@@ -3324,6 +3324,18 @@
     ],
     "package": "Adaptive Cruise Control (ACC) & Lane Assist"
   },
+  "Tesla AP1 Model S 2014-16": {
+    "platform": "TESLA_AP1_MODELS",
+    "make": "Tesla",
+    "brand": "tesla",
+    "model": "AP1 Model S",
+    "year": [
+      "2014",
+      "2015",
+      "2016"
+    ],
+    "package": "All"
+  },
   "Tesla Model 3 (with HW3) 2019-23": {
     "platform": "TESLA_MODEL_3",
     "make": "Tesla",

@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from enum import Enum, IntFlag
 from opendbc.car import Bus, CarSpecs, DbcDict, PlatformConfig, Platforms
-from opendbc.car.lateral import AngleSteeringLimitsVM
+from opendbc.car.lateral import AngleSteeringLimits, AngleSteeringLimitsVM
 from opendbc.car.structs import CarParams, CarState
 from opendbc.car.docs_definitions import CarDocs, CarFootnote, CarHarness, CarParts, Column, SupportType
 from opendbc.car.fw_query_definitions import FwQueryConfig, Request, StdQueries
@@ -40,12 +40,32 @@ class TeslaCarHW4ModelSXDocs(TeslaCarDocsHW4):
   support_link: str = "community"
 
 
+
+@dataclass
+class TeslaAp1CarDocs(CarDocs):
+  package: str = "All"
+  # Custom AP1 / Mobileye chassis harness. Not the Model 3/Y Tesla A/B harness.
+  car_parts: CarParts = field(default_factory=CarParts.common([CarHarness.custom]))
+  support_type: SupportType = SupportType.COMMUNITY
+  support_link: str = "community"
+
+
+@dataclass
+class TeslaAp1PlatformConfig(PlatformConfig):
+  # Chassis bus uses tesla_can.dbc (AP1 Model S). No party/radar DBC for this platform.
+  dbc_dict: DbcDict = field(default_factory=lambda: {Bus.chassis: 'tesla_can'})
+
+
 @dataclass
 class TeslaPlatformConfig(PlatformConfig):
   dbc_dict: DbcDict = field(default_factory=lambda: {Bus.party: 'tesla_model3_party', Bus.adas: 'tesla_model3_vehicle'})
 
 
 class CAR(Platforms):
+  TESLA_AP1_MODELS = TeslaAp1PlatformConfig(
+    [TeslaAp1CarDocs("Tesla AP1 Model S 2014-16")],
+    CarSpecs(mass=2100., wheelbase=2.959, steerRatio=15.0),
+  )
   TESLA_MODEL_3 = TeslaPlatformConfig(
     [
       # TODO: do we support 2017? It's HW3
@@ -100,6 +120,9 @@ class CANBUS:
   party = 0
   vehicle = 1
   autopilot_party = 2
+  # AP1 Model S aliases. Same numbers as party / autopilot_party.
+  chassis = 0
+  autopilot_chassis = 2
 
 
 GEAR_MAP = {
@@ -113,6 +136,18 @@ GEAR_MAP = {
 
 
 class CarControllerParams:
+  # AP1 Model S: Tinkla earlytesla-panda TESLA_LOOKUP_ANGLE_RATE_UP / _DOWN.
+  # Used by ap1_carcontroller. Model 3/Y still uses ANGLE_LIMITS below.
+  AP1_ANGLE_LIMITS = AngleSteeringLimits(
+    819.2,  # deg, EPAS_internalSAS range
+    ([2., 7., 17.], [8., 4., 2.5]),
+    ([2., 7., 17.], [9., 5., 4.5]),
+  )
+  AP1_STEER_STEP = 2  # 50 Hz
+  AP1_ACCEL_TO_SPEED_MULTIPLIER = 3
+  AP1_JERK_LIMIT_MAX = 8
+  AP1_JERK_LIMIT_MIN = -8
+
   ANGLE_LIMITS: AngleSteeringLimitsVM = AngleSteeringLimitsVM(
     # EPAS faults above this angle
     360,  # deg
@@ -130,12 +165,16 @@ class CarControllerParams:
 class TeslaSafetyFlags(IntFlag):
   LONG_CONTROL = 1
   FSD_14 = 2
+  # AP1 Model S on the chassis bus. Bit 8 (0x100). Clear of LONG_CONTROL and FSD_14.
+  # BogPilot's panda used bit 3 (8) for the same concept; that numbering is not used here.
+  AP1 = 0x100
 
 
 class TeslaFlags(IntFlag):
   LONG_CONTROL = 1
   FSD_14 = 2
   MISSING_DAS_SETTINGS = 4
+  AP1 = 0x100
 
 
 DBC = CAR.create_dbc_map()

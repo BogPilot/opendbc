@@ -1,6 +1,7 @@
 #pragma once
 
 #include "opendbc/safety/declarations.h"
+#include "opendbc/safety/modes/tesla_ap1.h"
 
 #define TESLA_COMMON_RX_CHECKS \
   {.msg = {{0x2b9, 2, 8, 25U, .max_counter = 7U, .ignore_quality_flag = true}, { 0 }, { 0 }}},    /* DAS_control */                                  \
@@ -16,6 +17,8 @@
 #define TESLA_VEHICLE_BUS_ADDR_CHECK \
   {.msg = {{0x3DF, 1, 8, 2U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true, .ignore_frequency_check = true}, { 0 }, { 0 }}},    /* UI_status2 */ \
 
+// AP1 Model S on the chassis bus. Set from TESLA_FLAG_AP1 in tesla_init. See tesla_ap1.h.
+static bool tesla_ap1 = false;
 static bool tesla_longitudinal = false;
 static bool tesla_fsd_14 = false;
 static bool tesla_stock_aeb = false;
@@ -128,7 +131,7 @@ static int tesla_get_steer_ctrl_type(const int ctrl_type) {
   return steer_ctrl_type;
 }
 
-static void tesla_rx_hook(const CANPacket_t *msg) {
+static void tesla_m3y_rx_hook(const CANPacket_t *msg) {
 
   if (msg->bus == 0U) {
     // Steering angle: (0.1 * val) - 819.2 in deg.
@@ -236,7 +239,7 @@ static void tesla_rx_hook(const CANPacket_t *msg) {
 }
 
 
-static bool tesla_tx_hook(const CANPacket_t *msg) {
+static bool tesla_m3y_tx_hook(const CANPacket_t *msg) {
   const AngleSteeringLimits TESLA_STEERING_LIMITS = {
     .max_angle = 3600,  // 360 deg, EPAS faults above this
     .angle_deg_to_can = 10,
@@ -338,7 +341,7 @@ static bool tesla_tx_hook(const CANPacket_t *msg) {
   return tx;
 }
 
-static bool tesla_fwd_hook(int bus_num, int addr) {
+static bool tesla_m3y_fwd_hook(int bus_num, int addr) {
   bool block_msg = false;
 
   if (bus_num == 2) {
@@ -363,7 +366,7 @@ static bool tesla_fwd_hook(int bus_num, int addr) {
   return block_msg;
 }
 
-static safety_config tesla_init(uint16_t param) {
+static safety_config tesla_m3y_init(uint16_t param) {
 
   static const CanMsg TESLA_M3_Y_TX_MSGS[] = {
     {0x488, 0, 4, .check_relay = true, .disable_static_blocking = true},   // DAS_steeringControl
@@ -430,6 +433,60 @@ static safety_config tesla_init(uint16_t param) {
     SET_RX_CHECKS(tesla_model3_y_vehicle_bus_rx_checks, ret);
   } else {
     SET_RX_CHECKS(tesla_model3_y_rx_checks, ret);
+  }
+  return ret;
+}
+
+// Dispatch: AP1 Model S uses tesla_ap1.h, everything else is the unchanged Model 3/Y/X code above.
+static void tesla_rx_hook(const CANPacket_t *msg) {
+  if (tesla_ap1) {
+    tesla_ap1_rx_hook(msg);
+  } else {
+    tesla_m3y_rx_hook(msg);
+  }
+}
+
+static bool tesla_tx_hook(const CANPacket_t *msg) {
+  bool tx;
+  if (tesla_ap1) {
+    tx = tesla_ap1_tx_hook(msg);
+  } else {
+    tx = tesla_m3y_tx_hook(msg);
+  }
+  return tx;
+}
+
+static bool tesla_fwd_hook(int bus_num, int addr) {
+  bool block_msg;
+  if (tesla_ap1) {
+    block_msg = tesla_ap1_fwd_hook(bus_num, addr);
+  } else {
+    block_msg = tesla_m3y_fwd_hook(bus_num, addr);
+  }
+  return block_msg;
+}
+
+static safety_config tesla_init(uint16_t param) {
+  // AP1 Model S (chassis bus 0). Bit 8 (0x100), clear of LONG_CONTROL (1) and FSD_14 (2).
+  // BogPilot's own panda used bit 3 (8) for AP1; that numbering is not used here.
+  const uint16_t TESLA_FLAG_AP1 = 0x100;
+  tesla_ap1 = GET_FLAG(param, TESLA_FLAG_AP1);
+
+  safety_config ret;
+  if (tesla_ap1) {
+    // Clear Model 3/Y state so nothing stale from a previous init is left behind
+    tesla_longitudinal = false;
+    tesla_fsd_14 = false;
+    tesla_has_vehicle_bus = false;
+    tesla_mads_screen_button_fingers = 0U;
+    tesla_autopark = false;
+    tesla_autopark_prev = false;
+    tesla_stock_aeb = false;
+    tesla_stock_lkas = false;
+    tesla_stock_lkas_prev = false;
+    ret = tesla_ap1_init(param);
+  } else {
+    ret = tesla_m3y_init(param);
   }
   return ret;
 }
