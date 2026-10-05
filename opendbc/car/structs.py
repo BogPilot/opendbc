@@ -144,6 +144,10 @@ class CarControlSP:
   leadOne: 'LeadData' = field(default_factory=lambda: LeadData())
   leadTwo: 'LeadData' = field(default_factory=lambda: LeadData())
   intelligentCruiseButtonManagement: 'IntelligentCruiseButtonManagement' = field(default_factory=lambda: IntelligentCruiseButtonManagement())
+  # modelV2.position x / y (ego frame), filled by controlsd_ext only for platforms that draw the model path on the
+  # instrument cluster (Tesla AP1). Empty otherwise or when modelV2 is not valid.
+  modelPathX: list[float] = auto_field()
+  modelPathY: list[float] = auto_field()
 
   @auto_dataclass
   class Param:
@@ -166,3 +170,13 @@ class CarControlSP:
 @auto_dataclass
 class CarStateSP:
   speedLimit: float = auto_field()
+  # The car keeps the driver override after steeringPressed ends because lateral is still yielded (Tesla AP1 resume
+  # hold). selfdrived adds steerOverride while set. steeringPressed itself is not extended (driver monitoring).
+  steerOverrideHold: bool = auto_field()
+  # The car asks for a quiet, warning-only "steering not active" alert (Tesla AP1: EPAS stays INHIBITED while
+  # openpilot wants lateral). Not a fault, does not change latActive.
+  steerInactiveSilent: bool = auto_field()
+  # A driving personality the car requests from a physical control (Tesla AP1 follow-distance stalk detent).
+  # selfdrived applies it when the request changes. personalityRequest is a log.LongitudinalPersonality value.
+  personalityRequestValid: bool = auto_field()
+  personalityRequest: int = auto_field()

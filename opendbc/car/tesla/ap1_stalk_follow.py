@@ -1,4 +1,4 @@
-"""AP1 stalk distance scroll to FrogPilot follow profiles.
+"""AP1 stalk distance scroll to follow profiles (BogPilot) and sunnypilot personalities.
 
 Pure mapping. No CAN, no params, no controlsd, no actuation.
 
@@ -214,3 +214,26 @@ def apply_stalk_t_follow(t_follow, speed_offset, enabled):
   if enabled and speed_offset > 0.0:
     return float(speed_offset)
   return t_follow
+
+
+# sunnypilot has three personalities and no traffic mode or per-detent follow
+# time, so the seven detents map onto LongitudinalPersonality like this:
+#   1, 2, 3 -> aggressive (BogPilot: 1.00 s traffic, 1.125 s, 1.25 s; aggressive
+#              1.25 s is the closest sunnypilot gap to all three)
+#   5       -> standard   (BogPilot: standard)
+#   7       -> relaxed    (BogPilot: relaxed)
+#   4, 6    -> no request: the last personality is held (BogPilot: follow time
+#              only, personality held; the midpoint is equidistant so picking
+#              a neighbor would be arbitrary)
+_SP_PERSONALITY_BY_DETENT = {1: 0, 2: 0, 3: 0, 5: 1, 7: 2}
+
+
+def ap1_stalk_personality(decision):
+  """LongitudinalPersonality for one stalk decision, or None for no request.
+
+  Not ready (no detent seen yet) is None. A held SNA sample keeps the last
+  detent, so it keeps the same request.
+  """
+  if decision is None or not decision.ready or decision.detent is None:
+    return None
+  return _SP_PERSONALITY_BY_DETENT.get(decision.detent)

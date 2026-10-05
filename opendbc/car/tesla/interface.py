@@ -2,6 +2,7 @@ from opendbc.car import Bus, get_safety_config, structs
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.tesla.ap1_carcontroller import Ap1CarController
 from opendbc.car.tesla.ap1_carstate import Ap1CarState
+from opendbc.car.tesla.ap1_hso import Ap1EpasInhibitAlert
 from opendbc.car.tesla.carcontroller import CarController
 from opendbc.car.tesla.carstate import CarState
 from opendbc.car.tesla.values import TeslaAp1SafetyFlags, TeslaSafetyFlags, TeslaFlags, CANBUS, CAR, DBC, FSD_14_FW, Ecu
@@ -21,6 +22,21 @@ class CarInterface(CarInterfaceBase):
       self.CarState = Ap1CarState
       self.CarController = Ap1CarController
     super().__init__(CP, CP_SP)
+    self.ap1_inhibit_alert = Ap1EpasInhibitAlert() if CP.flags & TeslaFlags.AP1 else None
+
+  def update(self, can_packets):
+    ret, ret_sp = super().update(can_packets)
+    if self.ap1_inhibit_alert is not None:
+      # BogPilot added these events in the car interface. sunnypilot builds car events in selfdrived from
+      # carState, so the AP1 controller state (one step old, as in BogPilot) goes out on carStateSP instead.
+      cc_yield = getattr(self.CC, "ap1_yield", None)
+      yield_active = bool(getattr(cc_yield, "active", False))
+      # Resume hold: hands are back at 0 but 0x488 is still NONE. Keep the override (grey border) until lat resumes.
+      ret_sp.steerOverrideHold = yield_active and not ret.steeringPressed
+      ret_sp.steerInactiveSilent = self.ap1_inhibit_alert.update(
+        getattr(self.CC, "lat_wanted", False), self.CS.hands_on_level, yield_active,
+        self.CS.eac_status, ret.steerFaultPermanent)
+    return ret, ret_sp
 
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:

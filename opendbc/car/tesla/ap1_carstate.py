@@ -1,19 +1,26 @@
 """AP1 Model S CarState. Chassis bus 0 + autopilot chassis bus 2, tesla_can.dbc.
 
-Ported from BogPilot/openpilot tag ap1-driving-milestone-1 (013f1ffa)
+Ported from BogPilot/openpilot tag ap1-driving-milestone-2 (92e84996)
 selfdrive/car/tesla/carstate.py AP1 path. No Raven branch.
+
+steeringPressed is any non-zero EPAS hands level (grey override border). The
+Tinkla hands pause at level >= 2 and the resume hold live in the AP1
+CarController. The follow-distance stalk is published as a personality
+request on CarStateSP (no gapAdjustCruise presses).
 """
 
 from __future__ import annotations
 
 import copy
+import math
 from collections import deque
 from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
-from opendbc.car.tesla.ap1_hso import ap1_steering_pressed
-from opendbc.car.tesla.ap1_stalk_follow import dtr_sample, follow_seconds, parse_stalk_raw
+from opendbc.car.tesla.ap1_cluster import CLUSTER_ADDRS, COUNTER_SIGNALS, MSG_NAMES
+from opendbc.car.tesla.ap1_hso import ap1_driver_input
+from opendbc.car.tesla.ap1_stalk_follow import ap1_stalk_personality, dtr_sample, follow_seconds, parse_stalk_raw
 from opendbc.car.tesla.ap1_steer_fault import steer_fault_temporary
 from opendbc.car.tesla.values import CANBUS, DBC, GEAR_MAP
 
@@ -27,8 +34,6 @@ _BUTTONS = (
   (ButtonType.decelCruise, "STW_ACTN_RQ", "SpdCtrlLvr_Stat", (8, 32)),
   (ButtonType.cancel, "STW_ACTN_RQ", "SpdCtrlLvr_Stat", (1,)),
   (ButtonType.resumeCruise, "STW_ACTN_RQ", "SpdCtrlLvr_Stat", (2,)),
-  # Stalk distance scroll -> personality cycle (sunnypilot selfdrived listens for gapAdjustCruise)
-  (ButtonType.gapAdjustCruise, "STW_ACTN_RQ", "DTR_Dist_Rq", (0, 33, 66, 100, 133, 166, 200)),
 )
 
 _DOORS = (
@@ -50,7 +55,10 @@ class Ap1CarState(CarStateBase):
     self.acc_state = 0
     self.das_control_counters: deque[int] = deque(maxlen=32)
     self.stalk_follow = None
-    self._prev_dtr_raw = None
+    self.eac_status = None
+    # {addr: decoded values} for stock cluster frames (bus 2) that arrived this
+    # step. Read by the AP1 CarController for the cluster substitution.
+    self.cluster_stock = {}
 
   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
     cp = can_parsers[Bus.chassis]
@@ -81,7 +89,11 @@ class Ap1CarState(CarStateBase):
     ret.steeringAngleDeg = -epas_status["EPAS_internalSAS"]
     ret.steeringRateDeg = -cp.vl["STW_ANGLHP_STAT"]["StW_AnglHP_Spd"]
     ret.steeringTorque = -epas_status["EPAS_torsionBarTorque"]
-    ret.steeringPressed = ap1_steering_pressed(self.hands_on_level)
+    # Any non-zero hands level is driver input (override, grey border), as in
+    # frog_ap1 and the stock Tesla port. AP1 EPAS reports 0, 1, 3. The AP1
+    # lateral pause stays at TinklaHandsOnLevel 2 in the CarController.
+    ret.steeringPressed = ap1_driver_input(self.hands_on_level)
+    self.eac_status = steer_status
     self.eac_fault = steer_status == "EAC_FAULT"
     ret.steerFaultPermanent = self.eac_fault
     ret.steerFaultTemporary = steer_fault_temporary(self.steer_warning, True)
@@ -106,28 +118,13 @@ class Ap1CarState(CarStateBase):
       int(cp.vl["DI_torque2"]["DI_gear"]), "DI_GEAR_INVALID")
     ret.gearShifter = GEAR_MAP[gear_name]
 
-    # Buttons. Distance detents only emit gapAdjustCruise on a change between known raws.
+    # Buttons
     button_events = []
     for event_type, addr, signal, values in _BUTTONS:
-      raw = cp.vl[addr][signal]
-      if event_type == ButtonType.gapAdjustCruise:
-        state = (raw in values) and (self._prev_dtr_raw is not None) and (raw != self._prev_dtr_raw)
-        # Rising-edge only for personality cycle
-        pressed = bool(state)
-        if self.button_states[event_type] != pressed and pressed:
-          event = structs.CarState.ButtonEvent(type=event_type, pressed=True)
-          button_events.append(event)
-          # Matching falling edge so selfdrived's "not pressed" check fires
-          button_events.append(structs.CarState.ButtonEvent(type=event_type, pressed=False))
-        self.button_states[event_type] = pressed
-        if raw in values:
-          self._prev_dtr_raw = raw
-      else:
-        state = raw in values
-        if self.button_states[event_type] != state:
-          event = structs.CarState.ButtonEvent(type=event_type, pressed=state)
-          button_events.append(event)
-        self.button_states[event_type] = state
+      state = cp.vl[addr][signal] in values
+      if self.button_states[event_type] != state:
+        button_events.append(structs.CarState.ButtonEvent(type=event_type, pressed=state))
+      self.button_states[event_type] = state
     ret.buttonEvents = button_events
 
     # Doors
@@ -146,8 +143,10 @@ class Ap1CarState(CarStateBase):
     # AEB
     ret.stockAeb = cp_cam.vl["DAS_control"]["DAS_aebEvent"] == 1
 
-    # Stalk follow. Also publish seconds on cruiseState.speedOffset for any
-    # follow-time consumer (BogPilot used FrogPilotFollowing).
+    # Stalk follow detent (DTR_Dist_Rq). A zero timestamp is the parser
+    # default, not ACC_DIST_1. sunnypilot has no follow-seconds input, so the
+    # detent becomes a personality request (ap1_stalk_personality); selfdrived
+    # applies it when it changes. follow_seconds stays available for tests/docs.
     stw = cp.vl.get("STW_ACTN_RQ")
     ts_map = getattr(cp, "ts_nanos", {}).get("STW_ACTN_RQ", {})
     if not isinstance(stw, dict) or not isinstance(ts_map, dict):
@@ -155,17 +154,32 @@ class Ap1CarState(CarStateBase):
     else:
       raw = dtr_sample(stw.get("DTR_Dist_Rq"), ts_map.get("DTR_Dist_Rq", 0))
     self.stalk_follow = parse_stalk_raw(raw, self.stalk_follow)
-    # follow_seconds(self.stalk_follow) is available on CS.stalk_follow.
-    # sunnypilot CarState.cruiseState has no speedOffset field (BogPilot/FrogPilot did).
-    # Personality is cycled via gapAdjustCruise button events from DTR_Dist_Rq changes.
     _ = follow_seconds(self.stalk_follow)
+    personality = ap1_stalk_personality(self.stalk_follow)
+    ret_sp.personalityRequestValid = personality is not None
+    ret_sp.personalityRequest = int(personality) if personality is not None else 0
 
     # Messages needed by carcontroller
     self.msg_stw_actn_req = copy.copy(cp.vl["STW_ACTN_RQ"])
     self.acc_state = int(cp_cam.vl["DAS_control"]["DAS_accState"])
     self.das_control_counters.extend(cp_cam.vl_all["DAS_control"]["DAS_controlCounter"])
+    self.cluster_stock = self.new_cluster_frames(cp_cam)
 
     return ret, ret_sp
+
+  @staticmethod
+  def new_cluster_frames(cp_cam):
+    """Stock AutopilotStatus / DAS_status2 / DAS_lanes received this step.
+
+    A frame counts as new when its counter signal has a value in vl_all for
+    this update. vl holds the newest decoded values of that frame.
+    """
+    out = {}
+    for addr in CLUSTER_ADDRS:
+      name = MSG_NAMES[addr]
+      if len(cp_cam.vl_all[name].get(COUNTER_SIGNALS[addr], [])):
+        out[addr] = dict(cp_cam.vl[name])
+    return out
 
   @staticmethod
   def get_can_parsers(CP, CP_SP):
@@ -184,8 +198,17 @@ class Ap1CarState(CarStateBase):
     cam_msgs = [
       ("DAS_control", 40),
     ]
+    # Stock cluster frames for the AP1 cluster substitution. NaN frequency is
+    # ignore_alive, and counter/checksum checks are off below, so these frames
+    # can never change canValid. A car without them just gets no cluster frames.
+    for addr in CLUSTER_ADDRS:
+      cam_msgs.append((MSG_NAMES[addr], math.nan))
+    cp_cam = CANParser(DBC[CP.carFingerprint][Bus.chassis], cam_msgs, CANBUS.autopilot_chassis)
+    for addr in CLUSTER_ADDRS:
+      cp_cam.message_states[addr].ignore_counter = True
+      cp_cam.message_states[addr].ignore_checksum = True
     return {
       Bus.chassis: CANParser(DBC[CP.carFingerprint][Bus.chassis], chassis_msgs, CANBUS.chassis),
       # ap_party key keeps CarInterfaceBase / Ext call sites consistent; physical bus is 2.
-      Bus.ap_party: CANParser(DBC[CP.carFingerprint][Bus.chassis], cam_msgs, CANBUS.autopilot_chassis),
+      Bus.ap_party: cp_cam,
     }
