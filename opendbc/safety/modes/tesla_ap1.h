@@ -6,7 +6,8 @@
 // A separate car port. Nothing here is shared with, or derived from, the Model 3/Y/X code in tesla.h.
 //
 // Reference: BogGyver/Tinkla (BogGyver/panda f7751e4 board/safety/safety_tesla.h, has_ap_hardware path),
-// via BogPilot/openpilot tag ap1-driving-milestone-1 (013f1ffa) panda/board/safety/safety_tesla.h.
+// via BogPilot/openpilot tags ap1-driving-milestone-1 (013f1ffa) and ap1-driving-milestone-2 (92e84996)
+// panda/board/safety/safety_tesla.h (milestone 2 adds the AP1 instrument-cluster substitution).
 // Message layouts are opendbc tesla_can.dbc (same frames as BogGyver/opendbc 9c0b6fe tesla_can.dbc).
 //
 // Safety param: BogGyver/Tinkla's numbering (safety_tesla.h FLAG_TESLA_*), not the Model 3/Y layout.
@@ -21,6 +22,12 @@
 //  - 0x2b9 min accel limit is -3.52 m/s^2 (BogPilot). BogGyver/Tinkla allowed -4.51.
 //  - 0x349 (all-zero Hold clear) is only allowed with longitudinal control.
 //  - longitudinal is only honored in ALLOW_DEBUG builds (BogGyver/Tinkla honored it in all builds).
+//
+// Instrument-cluster frames (BogPilot milestone 2, Tinkla TESLA_AP_FWD_MODDED idea): openpilot rebuilds each new
+// stock 0x399 AutopilotStatus / 0x389 DAS_status2 / 0x239 DAS_lanes from bus 2 and sends it on bus 0 with stock
+// counter + 1. The stock copy from bus 2 is dropped only while openpilot sent that address within 1.5x its stock
+// period (750 ms for the 2 Hz 0x399 / 0x389, 150 ms for the 10 Hz 0x239). A 0x399 with an active autopilot state
+// (3, 4, 5) is rejected unless controls are allowed. No 0x309 / 0x3a9 / 0x3e9.
 
 #define TESLA_AP1_FLAG_LONG_CONTROL 2U   // BogGyver/Tinkla FLAG_TESLA_LONG_CONTROL
 #define TESLA_AP1_FLAG_HAS_AP 16U        // BogGyver/Tinkla FLAG_TESLA_HAS_AP
@@ -37,6 +44,23 @@ static uint32_t tesla_ap1_last_steer_tx_ts = 0U;
 static uint32_t tesla_ap1_last_long_tx_ts = 0U;
 static bool tesla_ap1_steer_tx_seen = false;
 static bool tesla_ap1_long_tx_seen = false;
+
+// AP1 cluster substitution, per address. BogPilot TESLA_AP1_CLUSTER_* values.
+#define TESLA_AP1_CLUSTER_LEN 3
+static uint32_t tesla_ap1_cluster_tx_ts[TESLA_AP1_CLUSTER_LEN] = {0U, 0U, 0U};
+static bool tesla_ap1_cluster_tx_seen[TESLA_AP1_CLUSTER_LEN] = {false, false, false};
+
+static int tesla_ap1_cluster_index(int addr) {
+  // 0x399 AutopilotStatus, 0x389 DAS_status2, 0x239 DAS_lanes
+  static const int TESLA_AP1_CLUSTER_ADDRS[TESLA_AP1_CLUSTER_LEN] = {0x399, 0x389, 0x239};
+  int idx = -1;
+  for (int i = 0; i < TESLA_AP1_CLUSTER_LEN; i++) {
+    if (TESLA_AP1_CLUSTER_ADDRS[i] == addr) {
+      idx = i;
+    }
+  }
+  return idx;
+}
 
 static bool tesla_ap1_op_recently_sent(uint32_t last_ts, bool seen, uint32_t timeout_us) {
   bool recent = false;
@@ -191,6 +215,15 @@ static bool tesla_ap1_tx_hook(const CANPacket_t *msg) {
     }
   }
 
+  // 0x399 AutopilotStatus (cluster): an active autopilot state (3, 4, 5) needs controls allowed.
+  // autopilotStatus is bits 0-3. 0x389 / 0x239 carry no state openpilot could fake.
+  if (msg->addr == 0x399U) {
+    int autopilot_state = msg->data[0] & 0x0FU;
+    if ((autopilot_state >= 3) && (autopilot_state <= 5) && !controls_allowed) {
+      violation = true;
+    }
+  }
+
   if (violation) {
     tx = false;
   }
@@ -205,12 +238,19 @@ static bool tesla_ap1_tx_hook(const CANPacket_t *msg) {
       tesla_ap1_last_long_tx_ts = microsecond_timer_get();
       tesla_ap1_long_tx_seen = true;
     }
+    int idx = tesla_ap1_cluster_index((int)msg->addr);
+    if (idx >= 0) {
+      tesla_ap1_cluster_tx_ts[idx] = microsecond_timer_get();
+      tesla_ap1_cluster_tx_seen[idx] = true;
+    }
   }
 
   return tx;
 }
 
 static bool tesla_ap1_fwd_hook(int bus_num, int addr) {
+  // Stock-drop window per cluster address: 1.5x the stock period (2 Hz, 2 Hz, 10 Hz in AP1 rlogs)
+  static const uint32_t TESLA_AP1_CLUSTER_TIMEOUT_US[TESLA_AP1_CLUSTER_LEN] = {750000U, 750000U, 150000U};
   bool block_msg = false;
 
   // Autopilot to chassis. Bus 0 to 2 is always forwarded.
@@ -223,6 +263,13 @@ static bool tesla_ap1_fwd_hook(int bus_num, int addr) {
     if (tesla_ap1_longitudinal && (addr == 0x2b9) && !tesla_ap1_stock_aeb) {
       block_msg = tesla_ap1_op_recently_sent(tesla_ap1_last_long_tx_ts, tesla_ap1_long_tx_seen,
                                              TESLA_AP1_LONG_SUBSTITUTE_TIMEOUT_US);
+    }
+
+    // Cluster: same rule, per address. Stock frames flow unless openpilot sent its copy recently.
+    int idx = tesla_ap1_cluster_index(addr);
+    if (idx >= 0) {
+      block_msg = tesla_ap1_op_recently_sent(tesla_ap1_cluster_tx_ts[idx], tesla_ap1_cluster_tx_seen[idx],
+                                             TESLA_AP1_CLUSTER_TIMEOUT_US[idx]);
     }
   }
 
@@ -238,6 +285,9 @@ static safety_config tesla_ap1_init(uint16_t param) {
     {0x45, 2, 8, .check_relay = false},                                   // STW_ACTN_RQ (cancel)
     {0x2b9, 0, 8, .check_relay = false},                                  // DAS_control (long only)
     {0x349, 0, 8, .check_relay = false},                                  // Hold clear (long only, all zero)
+    {0x399, 0, 8, .check_relay = false},                                  // AutopilotStatus (cluster)
+    {0x389, 0, 8, .check_relay = false},                                  // DAS_status2 (cluster)
+    {0x239, 0, 8, .check_relay = false},                                  // DAS_lanes (cluster)
   };
 
   // BogPilot tesla_rx_checks. tesla_can.dbc frames carry no counter/checksum the old panda checked.
@@ -266,6 +316,10 @@ static safety_config tesla_ap1_init(uint16_t param) {
   tesla_ap1_long_tx_seen = false;
   tesla_ap1_last_steer_tx_ts = 0U;
   tesla_ap1_last_long_tx_ts = 0U;
+  for (int i = 0; i < TESLA_AP1_CLUSTER_LEN; i++) {
+    tesla_ap1_cluster_tx_ts[i] = 0U;
+    tesla_ap1_cluster_tx_seen[i] = false;
+  }
 
   safety_config ret;
   SET_TX_MSGS(TESLA_AP1_TX_MSGS, ret);

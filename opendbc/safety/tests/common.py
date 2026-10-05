@@ -1045,6 +1045,11 @@ class SafetyTest(SafetyTestBase):
             if attr == 'TestVolkswagenMqbLongSafety' and current_test.startswith('TestHondaBoschRadarless'):
               tx = list(filter(lambda m: m[0] not in [0x30c, ], tx))
 
+            # Tesla AP1 cluster DAS_status2 (0x389) and the Hyundai FCEV / CAN longitudinal message share an address
+            if (current_test.startswith('TestTeslaAp1') and attr.startswith('TestHyundai')) or \
+               (current_test.startswith('TestHyundai') and attr.startswith('TestTeslaAp1')):
+              tx = list(filter(lambda m: m[0] not in [0x389, ], tx))
+
             # TODO: Temporary, should be fixed in panda firmware, safety_honda.h
             if attr.startswith('TestHonda'):
               # exceptions for common msgs across different hondas

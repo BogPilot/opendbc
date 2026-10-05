@@ -17,6 +17,10 @@ MSG_STEER = 0x488
 MSG_STALK = 0x45
 MSG_LONG = 0x2b9
 MSG_HOLD = 0x349
+# AP1 cluster substitution (BogPilot ap1-driving-milestone-2): addr -> stock-drop window in us
+CLUSTER = {0x399: 750000, 0x389: 750000, 0x239: 150000}
+# DAS frames that are still never sent (no invented signals, no ALCA / body controls)
+OTHER_DAS = (0x309, 0x3a9, 0x3e9, 0x329, 0x369)
 
 
 class TestTeslaAp1SafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest):
@@ -29,6 +33,9 @@ class TestTeslaAp1SafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTes
     [MSG_STALK, 2],
     [MSG_LONG, 0],
     [MSG_HOLD, 0],
+    [0x399, 0],
+    [0x389, 0],
+    [0x239, 0],
   ]
 
   STANDSTILL_THRESHOLD = 0.1
@@ -225,6 +232,94 @@ class TestTeslaAp1SafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTes
     self.assertFalse(self._tx(self._accel_msg(self.MIN_ACCEL - 0.1)))
     # both accel limits negative is blocked
     self.assertFalse(self._tx(self._long_control_msg(10, accel_limits=(-1, -0.5))))
+
+  # --- AP1 cluster frames (port of BogPilot panda/tests/safety/test_tesla_ap1_cluster.py) ---
+
+  @staticmethod
+  def _status(state):
+    dat = bytearray(8)
+    dat[0] = state & 0x0F
+    return bytes(dat)
+
+  def _cluster_tx(self, addr, dat=None, bus=0):
+    return self._tx(libsafety_py.make_CANPacket(addr, bus, dat if dat is not None else b"\x00" * 8))
+
+  def test_cluster_tx_allowed_on_bus0_only(self):
+    for addr in CLUSTER:
+      self.assertTrue(self._cluster_tx(addr, self._status(2)), hex(addr))
+      self.assertFalse(self._cluster_tx(addr, self._status(2), bus=2), hex(addr))
+      self.assertFalse(self._tx(libsafety_py.make_CANPacket(addr, 0, b"\x00" * 7)), hex(addr))
+
+  def test_other_das_frames_not_allowed(self):
+    self.safety.set_controls_allowed(True)
+    for addr in OTHER_DAS:
+      self.assertFalse(self._cluster_tx(addr), hex(addr))
+
+  def test_active_autopilot_state_needs_controls_allowed(self):
+    for state in range(16):
+      self.safety.set_controls_allowed(False)
+      self.assertEqual(self._cluster_tx(0x399, self._status(state)), state not in (3, 4, 5), state)
+      self.safety.set_controls_allowed(True)
+      self.assertTrue(self._cluster_tx(0x399, self._status(state)), state)
+    # Only 0x399 carries that state. The same bits on 0x389 / 0x239 are not checked.
+    self.safety.set_controls_allowed(False)
+    self.assertTrue(self._cluster_tx(0x389, self._status(5)))
+    self.assertTrue(self._cluster_tx(0x239, self._status(5)))
+
+  def test_stock_cluster_forwarded_without_op_tx(self):
+    for addr in list(CLUSTER) + list(OTHER_DAS):
+      self.assertEqual(0, self.safety.safety_fwd_hook(2, addr), hex(addr))
+
+  def test_stock_cluster_dropped_only_while_op_recently_sent(self):
+    for addr, timeout in CLUSTER.items():
+      self.setUp()
+      t = 5_000_000
+      self.safety.set_timer(t)
+      self.assertTrue(self._cluster_tx(addr, self._status(2)))
+      self.assertEqual(-1, self.safety.safety_fwd_hook(2, addr), hex(addr))
+      self.safety.set_timer(t + timeout - 1)
+      self.assertEqual(-1, self.safety.safety_fwd_hook(2, addr), hex(addr))
+      self.safety.set_timer(t + timeout)
+      self.assertEqual(0, self.safety.safety_fwd_hook(2, addr), hex(addr))
+      # Other cluster addresses are tracked separately
+      self.safety.set_timer(t)
+      self._cluster_tx(addr, self._status(2))
+      for other in CLUSTER:
+        if other != addr:
+          self.assertEqual(0, self.safety.safety_fwd_hook(2, other), (hex(addr), hex(other)))
+      # Bus 0 to 2 is unchanged
+      self.assertEqual(2, self.safety.safety_fwd_hook(0, addr))
+
+  def test_rejected_cluster_tx_does_not_start_substitution(self):
+    self.safety.set_controls_allowed(False)
+    self.assertFalse(self._cluster_tx(0x399, self._status(5)))
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x399))
+
+  def test_init_clears_cluster_substitution(self):
+    self.assertTrue(self._cluster_tx(0x239))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x239))
+    self.setUp()
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x239))
+
+  def test_cluster_tx_does_not_change_steer_or_long_forwarding(self):
+    self.assertTrue(self._cluster_tx(0x399, self._status(2)))
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, MSG_STEER))
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, MSG_LONG))
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, MSG_HOLD))
+
+
+class TestTeslaAp1M3YParamNoCluster(unittest.TestCase):
+  """Model 3/Y/X params never get the AP1 cluster TX or the stock-cluster drop."""
+
+  def test_no_cluster_without_has_ap(self):
+    lib = libsafety_py.libsafety
+    for param in (0, int(TeslaSafetyFlags.LONG_CONTROL), int(TeslaSafetyFlags.FSD_14)):
+      lib.set_safety_hooks(CarParams.SafetyModel.tesla, param)
+      lib.init_tests()
+      lib.set_controls_allowed(True)
+      for addr in CLUSTER:
+        self.assertFalse(lib.safety_tx_hook(libsafety_py.make_CANPacket(addr, 0, b"\x02" + b"\x00" * 7)), (param, hex(addr)))
+        self.assertEqual(0, lib.safety_fwd_hook(2, addr), (param, hex(addr)))
 
 
 class TestTeslaAp1LongSafety(TestTeslaAp1SafetyBase):
