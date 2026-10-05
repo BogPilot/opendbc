@@ -13,6 +13,7 @@ class TeslaFlagsSP(IntFlag):
   MADS_SCREEN_BUTTON_3_FINGER = 4
   MADS_SCREEN_BUTTON_4_FINGER = 8
   MADS_SCREEN_BUTTON_5_FINGER = 16
+  AP1_IC_INTEGRATION = 32  # AP1 Model S: openpilot substitutes the instrument-cluster frames (0x399 / 0x389 / 0x239)
 
 
 class MadsScreenButtonType:

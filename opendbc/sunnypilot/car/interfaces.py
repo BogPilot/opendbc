@@ -14,6 +14,7 @@ from opendbc.car import structs
 from opendbc.car.can_definitions import CanRecvCallable, CanSendCallable
 from opendbc.car.hyundai.values import HyundaiFlags
 from opendbc.car.subaru.values import SubaruFlags
+from opendbc.car.tesla.values import TeslaFlags
 from opendbc.car.toyota.values import ToyotaSafetyFlags
 from opendbc.sunnypilot.car.hyundai.enable_radar_tracks import enable_radar_tracks as hyundai_enable_radar_tracks
 from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import LongitudinalTuningType
@@ -87,6 +88,7 @@ def setup_interfaces(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
   _initialize_custom_longitudinal_tuning(CI, CP, CP_SP, params_dict)
   _initialize_coop_steering(CP, CP_SP, params_dict)
   _initialize_tesla_mads_screen_button(CP, CP_SP, params_dict)
+  _initialize_tesla_ap1_ic_integration(CP, CP_SP, params_dict)
   _initialize_radar_tracks(CP, CP_SP, can_recv, can_send)
   _initialize_stop_and_go(CP, CP_SP, params_dict)
   _initialize_toyota(CP, CP_SP, params_dict)
@@ -127,6 +129,17 @@ def _initialize_tesla_mads_screen_button(CP: structs.CarParams, CP_SP: structs.C
     elif selection == MadsScreenButtonType.FIVE_FINGER:
       CP_SP.flags |= TeslaFlagsSP.MADS_SCREEN_BUTTON_5_FINGER.value
       CP_SP.safetyParam |= TeslaSafetyFlagsSP.MADS_SCREEN_BUTTON_5_FINGER
+
+
+def _initialize_tesla_ap1_ic_integration(CP: structs.CarParams, CP_SP: structs.CarParamsSP,
+                                         params_dict: dict[str, str]) -> None:
+  # AP1 Model S instrument-cluster substitution (BogPilot enableICIntegration). Default on for AP1 (a missing key
+  # counts as on); never set for any other Tesla. Read at car init, so a change applies on the next drive.
+  if CP.brand == 'tesla' and CP.flags & TeslaFlags.AP1:
+    value = params_dict.get("TeslaAp1IcIntegration", None)
+    enabled = True if value is None else str(value).strip().lower() in ("1", "true")
+    if enabled:
+      CP_SP.flags |= TeslaFlagsSP.AP1_IC_INTEGRATION.value
 
 
 def _initialize_radar_tracks(CP: structs.CarParams, CP_SP: structs.CarParamsSP,
