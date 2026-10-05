@@ -61,6 +61,8 @@ class TestTeslaFingerprint(unittest.TestCase):
   def test_fw_platform_code(self):
     # Every EPS FW must parse and its platform letter must match the car it's filed under.
     for car_model, ecus in FW_VERSIONS.items():
+      if car_model == CAR.TESLA_AP1_MODELS:
+        continue  # AP1 Model S EPAS uses a Tesla part number (F188), see test_tesla_ap1.py
       for fw in ecus.get((Ecu.eps, 0x730, None), []):
         m = FW_RE.match(fw)
 

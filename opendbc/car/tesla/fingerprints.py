@@ -7,6 +7,17 @@ from opendbc.sunnypilot.car.tesla.fingerprints_ext import FW_VERSIONS_EXT
 Ecu = CarParams.Ecu
 
 FW_VERSIONS = {
+  CAR.TESLA_AP1_MODELS: {
+    (Ecu.eps, 0x730, None): [
+      b'1016704-00-HAA\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    ],
+    (Ecu.electricBrakeBooster, 0x64d, None): [
+      b'1037123-00-A',
+    ],
+    (Ecu.fwdRadar, 0x671, None): [
+      b'\x01\x00W\x00\x00\x00\x07\x00\x00\x00\x00\x08\x00\x00\x00\x00\t\xff\xfe',
+    ],
+  },
   CAR.TESLA_MODEL_3: {
     (Ecu.eps, 0x730, None): [
       b'TeM3_E014p10_0.0.0 (16),E014.17.00',

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""AP1 Model S chassis safety. Ported from BogPilot safety_tesla.h AP1 path.
+"""AP1 Model S chassis safety (tesla_ap1.h).
 
+Reference: BogGyver/Tinkla panda safety_tesla.h (has_ap_hardware path), via BogPilot's AP1 port.
+Safety param uses BogGyver/Tinkla's FLAG_TESLA_* numbering, not the Model 3/Y layout.
 Does not weaken Model 3/Y tests in test_tesla.py.
 """
 import unittest
 
 from opendbc.car.structs import CarParams
-from opendbc.car.tesla.values import TeslaSafetyFlags
+from opendbc.car.tesla.values import TeslaAp1SafetyFlags, TeslaSafetyFlags
 from opendbc.safety.tests.libsafety import libsafety_py
 import opendbc.safety.tests.common as common
 from opendbc.safety.tests.common import CANPackerSafety
@@ -46,7 +48,7 @@ class TestTeslaAp1SafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTes
 
   packer: CANPackerSafety
   LONGITUDINAL = True
-  SAFETY_PARAM = int(TeslaSafetyFlags.AP1 | TeslaSafetyFlags.LONG_CONTROL)
+  SAFETY_PARAM = int(TeslaAp1SafetyFlags.HAS_AP | TeslaAp1SafetyFlags.LONG_CONTROL)
 
   def setUp(self):
     self.packer = CANPackerSafety("tesla_can")
@@ -131,11 +133,37 @@ class TestTeslaAp1SafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTes
     # large step must fail
     self.assertFalse(self._tx(self._angle_cmd_msg(20.0, True)))
 
-  def test_ap1_flag_is_bit_8(self):
-    self.assertEqual(int(TeslaSafetyFlags.AP1), 0x100)
-    self.assertEqual(int(TeslaSafetyFlags.LONG_CONTROL), 1)
-    self.assertEqual(int(TeslaSafetyFlags.FSD_14), 2)
-    self.assertEqual(self.SAFETY_PARAM & int(TeslaSafetyFlags.FSD_14), 0)
+  def test_ap1_flags_are_boggyver_layout(self):
+    # BogGyver/panda board/safety/safety_tesla.h: FLAG_TESLA_LONG_CONTROL = 2, FLAG_TESLA_HAS_AP = 16
+    self.assertEqual(int(TeslaAp1SafetyFlags.LONG_CONTROL), 2)
+    self.assertEqual(int(TeslaAp1SafetyFlags.HAS_AP), 16)
+    # The AP1 selector must never collide with a Model 3/Y/X safety bit
+    for flag in TeslaSafetyFlags:
+      self.assertEqual(int(flag) & int(TeslaAp1SafetyFlags.HAS_AP), 0, flag)
+
+  def test_model3y_params_never_select_ap1(self):
+    # Every Model 3/Y/X param combination keeps the Model 3/Y safety: AP1-only 0x45 cancel TX is rejected
+    all_m3y = 0
+    for flag in TeslaSafetyFlags:
+      all_m3y |= int(flag)
+    for param in range(all_m3y + 1):
+      if param & ~all_m3y:
+        continue
+      self.safety.set_safety_hooks(CarParams.SafetyModel.tesla, param)
+      self.safety.set_controls_allowed(True)
+      self.assertFalse(self._tx(self._stalk_cancel_msg(1)), param)
+    # The old SunnyTesla AP1 bit (0x100) no longer selects AP1 either
+    self.safety.set_safety_hooks(CarParams.SafetyModel.tesla, 0x101)
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self._tx(self._stalk_cancel_msg(1)))
+
+  def test_model3y_long_bit_does_not_enable_ap1_long(self):
+    # Model 3/Y LONG_CONTROL (1) means nothing to AP1. Only BogGyver/Tinkla LONG_CONTROL (2) does.
+    self.safety.set_safety_hooks(CarParams.SafetyModel.tesla, int(TeslaAp1SafetyFlags.HAS_AP | TeslaSafetyFlags.LONG_CONTROL))
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._stalk_cancel_msg(1)))
+    self.assertFalse(self._tx(self._long_control_msg(10)))
+    self.assertFalse(self._tx(self._hold_clear_msg()))
 
   def test_hold_clear_all_zero_only(self):
     self.safety.set_controls_allowed(True)
@@ -205,7 +233,7 @@ class TestTeslaAp1LongSafety(TestTeslaAp1SafetyBase):
 
 class TestTeslaAp1LatOnlySafety(TestTeslaAp1SafetyBase):
   LONGITUDINAL = False
-  SAFETY_PARAM = int(TeslaSafetyFlags.AP1)
+  SAFETY_PARAM = int(TeslaAp1SafetyFlags.HAS_AP)
 
   def test_no_long_tx(self):
     self.safety.set_controls_allowed(True)
@@ -214,6 +242,35 @@ class TestTeslaAp1LatOnlySafety(TestTeslaAp1SafetyBase):
 
   def test_hold_clear_all_zero_only(self):
     raise unittest.SkipTest("hold clear requires LONG")
+
+
+class TestTeslaAp1ReleaseBuild(unittest.TestCase):
+  """Release (non-ALLOW_DEBUG) panda builds ignore the AP1 long flag. Lateral and cancel still work."""
+
+  @classmethod
+  def setUpClass(cls):
+    cls.lib = libsafety_py.ffi.dlopen(libsafety_py._build_libsafety(release=True))
+
+  def setUp(self):
+    self.packer = CANPackerSafety("tesla_can")
+    self.lib.set_safety_hooks(CarParams.SafetyModel.tesla, int(TeslaAp1SafetyFlags.HAS_AP | TeslaAp1SafetyFlags.LONG_CONTROL))
+    self.lib.init_tests()
+    self.lib.set_controls_allowed(True)
+
+  def _tx(self, msg):
+    return self.lib.safety_tx_hook(msg)
+
+  def test_long_rejected_without_allow_debug(self):
+    long_msg = self.packer.make_can_msg_safety("DAS_control", 0, {"DAS_setSpeed": 10, "DAS_accState": 4,
+                                                                   "DAS_accelMin": 0, "DAS_accelMax": 0})
+    self.assertFalse(self._tx(long_msg))
+    self.assertFalse(self._tx(libsafety_py.make_CANPacket(MSG_HOLD, 0, b"\x00" * 8)))
+    # stock 0x2b9 keeps flowing from the autopilot side
+    self.assertEqual(0, self.lib.safety_fwd_hook(2, MSG_LONG))
+
+  def test_cancel_still_allowed(self):
+    cancel = self.packer.make_can_msg_safety("STW_ACTN_RQ", 0, {"SpdCtrlLvr_Stat": 1})
+    self.assertTrue(self._tx(cancel))
 
 
 if __name__ == "__main__":

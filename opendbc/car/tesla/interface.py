@@ -4,13 +4,10 @@ from opendbc.car.tesla.ap1_carcontroller import Ap1CarController
 from opendbc.car.tesla.ap1_carstate import Ap1CarState
 from opendbc.car.tesla.carcontroller import CarController
 from opendbc.car.tesla.carstate import CarState
-from opendbc.car.tesla.values import TeslaSafetyFlags, TeslaFlags, CANBUS, CAR, DBC, FSD_14_FW, Ecu
+from opendbc.car.tesla.values import TeslaAp1SafetyFlags, TeslaSafetyFlags, TeslaFlags, CANBUS, CAR, DBC, FSD_14_FW, Ecu
 from opendbc.car.tesla.radar_interface import RadarInterface, RADAR_START_ADDR
 
 from opendbc.sunnypilot.car.tesla.values import TeslaFlagsSP, TeslaSafetyFlagsSP
-
-# Chassis fingerprint: bus 0 must include these three AP1 addresses (BogPilot classify_ap1_chassis).
-_AP1_CHASSIS_ADDRS = frozenset((0x45, 0x2B9, 0x488))
 
 
 class CarInterface(CarInterfaceBase):
@@ -30,35 +27,15 @@ class CarInterface(CarInterfaceBase):
     ret.brand = "tesla"
 
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.tesla)]
+    ret.steerControlType = structs.CarParams.SteerControlType.angle
+
+    # AP1 Model S is its own port. Return before any Model 3/Y/X setting is applied.
+    if candidate == CAR.TESLA_AP1_MODELS:
+      return CarInterface._get_params_ap1(ret)
 
     ret.steerLimitTimer = 0.4
     ret.steerActuatorDelay = 0.1
     ret.steerAtStandstill = True
-
-    ret.steerControlType = structs.CarParams.SteerControlType.angle
-
-    if candidate == CAR.TESLA_AP1_MODELS:
-      # AP1 Model S: Mobileye chassis bus 0. Known-working BogPilot path.
-      # Safety param is AP1 | LONG when alpha long is on. LONG alone is Model 3/Y.
-      ret.flags |= TeslaFlags.AP1.value
-      ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.AP1.value
-      ret.radarUnavailable = True
-      ret.alphaLongitudinalAvailable = True
-      ret.dashcamOnly = False
-      ret.steerLimitTimer = 1.0
-      ret.steerActuatorDelay = 0.25
-      ret.longitudinalActuatorDelay = 0.5
-      ret.pcmCruise = True
-      # Warn if the live fingerprint is missing the chassis signature, but still
-      # allow CarPlatformBundle / fixed selection (same as BogPilot force fingerprint).
-      bus0 = fingerprint.get(CANBUS.chassis, {}) if isinstance(fingerprint, dict) else {}
-      if isinstance(bus0, dict) and bus0 and not (_AP1_CHASSIS_ADDRS <= set(bus0)):
-        # Soft note only; dashcam stays off so a forced platform can still engage.
-        pass
-      if alpha_long:
-        ret.openpilotLongitudinalControl = True
-        ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.LONG_CONTROL.value
-      return ret
 
     # Model X and HW 2.5 vehicles are missing DAS_settings
     if 0x293 not in fingerprint[CANBUS.autopilot_party]:
@@ -83,6 +60,34 @@ class CarInterface(CarInterfaceBase):
 
     ret.dashcamOnly = candidate in (CAR.TESLA_MODEL_X,)  # dashcam only, pending find invalidLkasSetting signal
 
+    return ret
+
+  @staticmethod
+  def _get_params_ap1(ret: structs.CarParams) -> structs.CarParams:
+    """AP1 Model S (Mobileye, chassis bus 0). A separate car port, nothing shared with Model 3/Y/X.
+
+    Reference: BogGyver/Tinkla AP1 (BogGyver/openpilot tesla_unity_dev selfdrive/car/tesla/interface.py and
+    BogGyver/panda board/safety/safety_tesla.h), via BogPilot's AP1 port.
+
+    Longitudinal is openpilot's by default and is not gated on AlphaLongitudinalEnabled (BogPilot
+    selfdrive/car/tesla/interface.py AP1 branch). BogGyver/Tinkla itself defaults AP1 to stock ACC and
+    opts in with TinklaEnableOPLong; there is no BogGyver opt-out, so none is added here.
+    """
+    ret.flags |= TeslaFlags.AP1.value
+    # BogGyver/Tinkla FLAG_TESLA_HAS_AP selects the AP1 safety; FLAG_TESLA_LONG_CONTROL allows chassis 0x2b9.
+    ret.safetyConfigs[0].safetyParam = int(TeslaAp1SafetyFlags.HAS_AP | TeslaAp1SafetyFlags.LONG_CONTROL)
+    ret.openpilotLongitudinalControl = True
+    ret.alphaLongitudinalAvailable = False
+    ret.radarUnavailable = True
+    ret.dashcamOnly = False
+    ret.pcmCruise = True
+    # BogGyver/Tinkla does not steer at standstill (steerAtStandstill left at its default, False).
+    ret.steerAtStandstill = False
+    # BogGyver/Tinkla interface.py: steerLimitTimer 1.0, steerActuatorDelay 0.25,
+    # longitudinalActuatorDelayUpperBound 0.5
+    ret.steerLimitTimer = 1.0
+    ret.steerActuatorDelay = 0.25
+    ret.longitudinalActuatorDelay = 0.5
     return ret
 
   @staticmethod

@@ -17,7 +17,7 @@
 #define TESLA_VEHICLE_BUS_ADDR_CHECK \
   {.msg = {{0x3DF, 1, 8, 2U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true, .ignore_frequency_check = true}, { 0 }, { 0 }}},    /* UI_status2 */ \
 
-// AP1 Model S on the chassis bus. Set from TESLA_FLAG_AP1 in tesla_init. See tesla_ap1.h.
+// AP1 Model S on the chassis bus. Set from BogGyver/Tinkla FLAG_TESLA_HAS_AP in tesla_init. See tesla_ap1.h.
 static bool tesla_ap1 = false;
 static bool tesla_longitudinal = false;
 static bool tesla_fsd_14 = false;
@@ -467,10 +467,9 @@ static bool tesla_fwd_hook(int bus_num, int addr) {
 }
 
 static safety_config tesla_init(uint16_t param) {
-  // AP1 Model S (chassis bus 0). Bit 8 (0x100), clear of LONG_CONTROL (1) and FSD_14 (2).
-  // BogPilot's own panda used bit 3 (8) for AP1; that numbering is not used here.
-  const uint16_t TESLA_FLAG_AP1 = 0x100;
-  tesla_ap1 = GET_FLAG(param, TESLA_FLAG_AP1);
+  // AP1 Model S (chassis bus 0) uses BogGyver/Tinkla's own safety param layout (tesla_ap1.h).
+  // FLAG_TESLA_HAS_AP (16) selects it. Model 3/Y/X only use LONG_CONTROL (1) and FSD_14 (2).
+  tesla_ap1 = GET_FLAG(param, TESLA_AP1_FLAG_HAS_AP);
 
   safety_config ret;
   if (tesla_ap1) {

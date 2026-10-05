@@ -3,17 +3,27 @@
 #include "opendbc/safety/declarations.h"
 
 // Tesla AP1 Model S: Mobileye autopilot on the chassis bus (panda bus 0, autopilot side bus 2).
-// Selected from tesla_init() only when TESLA_FLAG_AP1 (0x100) is set. Model 3/Y/X never reach this file.
+// A separate car port. Nothing here is shared with, or derived from, the Model 3/Y/X code in tesla.h.
 //
-// Ported from BogPilot/openpilot tag ap1-driving-milestone-1 (013f1ffa),
-// panda/board/safety/safety_tesla.h, non-powertrain non-Raven AP1 path.
-// Message layouts are opendbc tesla_can.dbc (same frames as earlytesla-opendbc 9c0b6fe).
+// Reference: BogGyver/Tinkla (BogGyver/panda f7751e4 board/safety/safety_tesla.h, has_ap_hardware path),
+// via BogPilot/openpilot tag ap1-driving-milestone-1 (013f1ffa) panda/board/safety/safety_tesla.h.
+// Message layouts are opendbc tesla_can.dbc (same frames as BogGyver/opendbc 9c0b6fe tesla_can.dbc).
 //
-// Differences from BogPilot, all stricter:
+// Safety param: BogGyver/Tinkla's numbering (safety_tesla.h FLAG_TESLA_*), not the Model 3/Y layout.
+//   FLAG_TESLA_LONG_CONTROL = 2   chassis 0x2b9 longitudinal (ALLOW_DEBUG builds only, see init)
+//   FLAG_TESLA_HAS_AP       = 16  AP hardware on the chassis bus; selects this file from tesla_init()
+// BogGyver/Tinkla's other bits (POWERTRAIN 1, RADAR_BEHIND_NOSECONE 4, HAS_IC_INTEGRATION 8,
+// NEED_RADAR_EMULATION 32, ENABLE_HAO 64, HAS_IBOOSTER 128) are not implemented and are ignored.
+//
+// Differences from BogGyver/Tinkla and BogPilot, all stricter:
 //  - 0x488 control type must be NONE (0) or ANGLE_CONTROL (1). BogPilot also let 2 through.
-//  - 0x2b9 may not have both accel limits below inactive (same rule as Model 3/Y long).
+//  - 0x2b9 may not have both accel limits below inactive (could reverse the car after a stop).
+//  - 0x2b9 min accel limit is -3.52 m/s^2 (BogPilot). BogGyver/Tinkla allowed -4.51.
 //  - 0x349 (all-zero Hold clear) is only allowed with longitudinal control.
-//  - longitudinal is only honored in ALLOW_DEBUG builds, like Model 3/Y alpha long.
+//  - longitudinal is only honored in ALLOW_DEBUG builds (BogGyver/Tinkla honored it in all builds).
+
+#define TESLA_AP1_FLAG_LONG_CONTROL 2U   // BogGyver/Tinkla FLAG_TESLA_LONG_CONTROL
+#define TESLA_AP1_FLAG_HAS_AP 16U        // BogGyver/Tinkla FLAG_TESLA_HAS_AP
 
 #define TESLA_AP1_STEER_SUBSTITUTE_TIMEOUT_US 100000U  // 100 ms, BogPilot value (openpilot sends 0x488 at 50 Hz)
 #define TESLA_AP1_LONG_SUBSTITUTE_TIMEOUT_US 50000U    // 50 ms, BogPilot value (0x2b9 follows the stock ~40 Hz counter)
@@ -241,10 +251,12 @@ static safety_config tesla_ap1_init(uint16_t param) {
     {.msg = {{0x318, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},   // GTW_carState
   };
 
+  // BogGyver/Tinkla honors FLAG_TESLA_LONG_CONTROL in every build. That panda predates comma's
+  // ALLOW_DEBUG gate on Tesla longitudinal; it is not an AP1-specific safety argument, so the gate stays.
+  // A release-signed panda therefore keeps stock ACC (0x2b9 TX rejected, stock 0x2b9 forwarded).
   tesla_ap1_longitudinal = false;
 #ifdef ALLOW_DEBUG
-  const uint16_t TESLA_FLAG_LONGITUDINAL_CONTROL = 1;
-  tesla_ap1_longitudinal = GET_FLAG(param, TESLA_FLAG_LONGITUDINAL_CONTROL);
+  tesla_ap1_longitudinal = GET_FLAG(param, TESLA_AP1_FLAG_LONG_CONTROL);
 #else
   SAFETY_UNUSED(param);
 #endif

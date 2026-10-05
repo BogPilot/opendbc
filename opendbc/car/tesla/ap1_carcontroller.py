@@ -5,7 +5,7 @@ selfdrive/car/tesla/carcontroller.py AP1 path.
 """
 
 from opendbc.can import CANPacker
-from opendbc.car import Bus, structs
+from opendbc.car import Bus
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.tesla.ap1_actuator_plan import (
   ap1_should_send_hold_clear,
