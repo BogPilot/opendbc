@@ -1,8 +1,8 @@
 """AP1 actuator decision for TESLA_AP1_MODELS.
 
-Angle steps use the Tinkla AP1 lookup, not Model 3/Y limits.
-
-Actuator decision for Tesla CarController.
+Ported from BogPilot/openpilot tag ap1-driving-milestone-2 (92e84996)
+selfdrive/car/tesla/actuator_plan.py. Angle steps use the Tinkla AP1 lookup,
+not Model 3/Y limits.
 
 CarController.update packs exactly the messages this plan names. No CAN
 packing happens here. While disengaged, the plan has no steering frame so
@@ -12,11 +12,13 @@ control type NONE. That is Tinkla's human-control and non-idle EPAS path,
 except EAC_ERROR_HIGH_ANGLE_REQ (6) and a latched EAC_ERROR_HANDS_ON (3).
 Those two are not path blocks once hands are below the HSO threshold. While
 enabled, hands are below that threshold, and EPAS is not EAC_FAULT, 0x488 is
-ANGLE: the planned angle when lat is active, otherwise the measured angle,
-rate limited and clipped to the measured wheel +/- 20 deg. DAS_control is planned
-only when the car params allow openpilot
-longitudinal control and CarControl.enabled and CarControl.longActive are
-both true. Otherwise the plan has no longitudinal command.
+ANGLE. If EPAS is not yet EAC_ACTIVE, a latched code 6/3 is set, or we are
+inside the engage soft-start window, the angle is the measured wheel so EPAS
+can accept control. Otherwise the planned angle is used when lat is active.
+Always rate limited and clipped to measured +/- 20 deg. DAS_control is planned
+only when the car params allow openpilot longitudinal control and
+CarControl.enabled and CarControl.longActive are both true. Otherwise the
+plan has no longitudinal command.
 """
 
 from dataclasses import dataclass
@@ -74,6 +76,13 @@ DAS_CONTROL_POWERTRAIN = 0x2BF
 # 4 (ACC_ON) in drive and 3 (ACC_HOLD) only for static cruise.
 ACC_HOLD = 3
 ACC_ON = 4
+
+# ~300 ms at 100 Hz CarController. Rising edge of enabled holds measured
+# ANGLE before the planner angle so EPAS can leave AVAILABLE/INHIBITED.
+AP1_ENGAGE_SOFT_START_FRAMES = 30
+
+# tesla_can.dbc VAL_ 880 EPAS_eacStatus.
+EAC_ACTIVE = "EAC_ACTIVE"
 
 
 @dataclass(frozen=True)
@@ -162,60 +171,81 @@ def _ap1_limited_angle(requested_angle_deg, last_angle_deg, measured_angle_deg, 
   return _clip(apply_angle, measured_angle_deg - 20, measured_angle_deg + 20)
 
 
+def ap1_hold_measured_angle(chassis_das_only, enabled, eac_fault, hands_pause,
+                           eac_status, epas_error, soft_start):
+  """True when AP1 must command ANGLE at the measured wheel, not the planner.
+
+  On a logged BogPilot drive EPAS stayed EAC_INHIBITED with code 6 while
+  openpilot kept sending planner ANGLE; the wheel never moved and there was no
+  UI fault. Hold measured until EAC_ACTIVE (and after soft-start / latched 6 or 3).
+  """
+  if not chassis_das_only or not enabled or eac_fault or hands_pause:
+    return False
+  if soft_start:
+    return True
+  # None means the caller did not pass status (older tests). Only a known
+  # non-ACTIVE status forces the measured hold.
+  if eac_status is not None and eac_status != EAC_ACTIVE:
+    return True
+  if epas_error in AP1_LATCHED_ANGLE_ERRORS:
+    return True
+  return False
+
+
 def build_actuator_plan(frame, lat_active, hands_on_fault, openpilot_longitudinal_control,
                         enabled, long_active,
                         measured_angle_deg, requested_angle_deg, last_angle_deg, v_ego, accel,
                         acc_state, das_counters, pcm_cancel, chassis_das_only=False,
-                        epas_error=None, eac_fault=False, hands_on_level=0):
-  """Same steering branches CarController.update had before this function existed.
+                        epas_error=None, eac_fault=False, hands_on_level=0,
+                        eac_status=None, soft_start=False, driver_yield=False,
+                        lat_enabled=None):
+  """Steering and longitudinal decision for one CarController step.
 
   Disengaged lateral: no steering frame. Sending type-NONE 0x488 while
   disengaged replaced stock Mobileye commands on AP1. AP1 with cruise enabled
   and lat inactive still sends 0x488 at the measured angle with type NONE,
-  except error code 6 and a latched hands-on code 3. Those do not force NONE
-  once hands are below 2. While enabled, hands are below 2, and EPAS is not
-  EAC_FAULT, code 6 and code 3 send ANGLE: the planned angle when lat is
-  active, otherwise the measured angle, rate limited and clipped to measured
-  +/- 20 deg. Other non-idle codes still take the NONE branch. Hands at or
-  above 2 also take NONE and do not cancel, including a live code 3.
-  apply_angle_last
-  tracks the commanded angle so the next path command starts from the wheel.
-  Longitudinal messages are built only when longitudinal_command_allowed is
-  true. An inactive long plan is empty.
+  except when ap1_hold_measured_angle is true (not ACTIVE, latched 6/3, or
+  soft-start): then type is ANGLE at the measured wheel. While EPAS is
+  EAC_ACTIVE, hands are below 2, and there is no latch/soft-start, lat active
+  sends the planned angle. Other non-idle codes with lat inactive still take
+  the NONE branch. Hands at or above 2 also take NONE and do not cancel.
+  driver_yield (AP1 resume hold, ap1_hso.Ap1DriverYield) is treated exactly
+  like hands at or above 2. apply_angle_last tracks the commanded angle so the
+  next path command starts from the wheel. Longitudinal messages are built only
+  when longitudinal_command_allowed is true. An inactive long plan is empty.
+
+  lat_enabled (sunnypilot only): the lateral engagement used by the steering
+  branches. None means `enabled` (BogPilot). The AP1 CarController passes
+  CarControl.enabled or an active MADS lateral, so a MADS lateral-only state
+  gets the same NONE / measured-angle handling as a full engage.
+  Longitudinal always uses `enabled`.
   """
 
+  steer_enabled = enabled if lat_enabled is None else lat_enabled
   lkas_enabled = lat_active and not hands_on_fault
   apply_angle_last = last_angle_deg
   steer = None
   # AP1 only. Hands pause and EAC_FAULT still win over a latched code 6 or 3.
   # Code 3 takes this path only after hands drop; at or above 2, hands_pause
   # keeps type NONE even though code 3 is not itself a temporary fault.
-  hands_pause = bool(chassis_das_only) and hands_on_level >= AP1_HANDS_ON_LEVEL
-  latched_angle = (
-    bool(chassis_das_only)
-    and bool(enabled)
-    and not hands_on_fault
-    and not hands_pause
-    and not eac_fault
-    and epas_error in AP1_LATCHED_ANGLE_ERRORS
-  )
+  hands_pause = bool(chassis_das_only) and (hands_on_level >= AP1_HANDS_ON_LEVEL or bool(driver_yield))
+  hold_measured = ap1_hold_measured_angle(
+    chassis_das_only, steer_enabled, eac_fault, hands_pause, eac_status, epas_error, soft_start)
   if chassis_das_only and eac_fault:
     lkas_enabled = False
 
   if frame % 2 == 0:
-    if lkas_enabled and not hands_pause:
+    if hold_measured:
+      # Measured ANGLE: EPAS inhibit recovery, latched 6/3, or engage soft-start.
+      apply_angle = _ap1_limited_angle(measured_angle_deg, last_angle_deg, measured_angle_deg, v_ego)
+      apply_angle_last = apply_angle
+      steer = SteerCommand(apply_angle, True, (frame // 2) % 16)
+    elif lkas_enabled and not hands_pause:
       # Angular rate limit based on speed, then the EPS clip.
       apply_angle = _ap1_limited_angle(requested_angle_deg, last_angle_deg, measured_angle_deg, v_ego)
       apply_angle_last = apply_angle
       steer = SteerCommand(apply_angle, True, (frame // 2) % 16)
-    elif latched_angle:
-      # Planner angle is not active. Command the measured wheel as ANGLE
-      # so EPAS can leave a latched code 6 or code 3. Still rate limited
-      # and clipped.
-      apply_angle = _ap1_limited_angle(measured_angle_deg, last_angle_deg, measured_angle_deg, v_ego)
-      apply_angle_last = apply_angle
-      steer = SteerCommand(apply_angle, True, (frame // 2) % 16)
-    elif chassis_das_only and enabled and not hands_on_fault:
+    elif chassis_das_only and steer_enabled and not hands_on_fault:
       # Cruise stays up. Do not send the planned path angle.
       apply_angle_last = measured_angle_deg
       steer = SteerCommand(measured_angle_deg, False, (frame // 2) % 16)
